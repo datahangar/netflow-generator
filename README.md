@@ -15,7 +15,7 @@ Changes
 * Added an option to specify a local IP (localipadd) from which packets should be originated.
 * Added an option to not print flow generation report.
 
-In TDB, I am also adding a python script that generates specific calls to flowgen for simulating traffic from a larger, random, network.
+In [this repo](https://github.com/jccardonar/generator_for_flowgen), one can find a python script that generates specific calls to flowgen for simulating traffic from a larger, random, network.
 
 License
 -------
