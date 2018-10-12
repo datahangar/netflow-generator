@@ -19,13 +19,14 @@
 
 /* TODO:
   - dns lookup for collector
-  - source ip spoof
+  - source ip spoof 
   - step support in range expression
   - absolute value for firstseen and last seen
 */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <getopt.h>
 #include <string.h>
 #include <errno.h>
@@ -60,6 +61,8 @@
 #define OPT_DSTAS	19
 #define OPT_SRCMASK	20
 #define OPT_DSTMASK	21
+#define OPT_NOT_PRINT_SUMMARY 22
+#define OPT_LOCAL_IP 23
 
 struct flow_exporter Ex;
 
@@ -68,7 +71,7 @@ int nosend_f = FALSE;
 
 void usage(void)
 {
-  fprintf(stderr,
+  fprintf(stderr, 
 "Usage: flowgen [options] [flowrec-options] <collector>\n\
  options:\n\
    -n, --count <num>\n\
@@ -78,6 +81,7 @@ void usage(void)
    -d, --debug <debug level>\n\
    -N, --nosend\n\
    -h, --help\n\
+   -m, --mute_summary\n\n\
  flowrec-options:\n\
    -w, --wait <wait time>\n\
    -i, --interval <interval>\n\
@@ -100,11 +104,13 @@ void usage(void)
    --srcas <src AS#>\n\
    --dstas <dst AS#>\n\
    --srcmask <src subnet mask length>\n\
-   --dstmask <dst subnet mask length>\n\n\
+   --dstmask <dst subnet mask length>\n\
   Numbers can be expressed using the following meta characters:\n\
     111      (static)\n\
     111-222  (sequential)\n\
     111:222  (random)\n\
+    111,222  (list)\n\
+    %%file[line] (get operation from file)\n\
     100@70,200@20,300@10   (probabilistic)\n");
   exit(1);
 }
@@ -115,6 +121,33 @@ void fatal(const char *msg)
   exit(1);
 }
 
+char * read_line(const char *filename, const int line_n)
+{
+	FILE *file = fopen(filename, "r");		
+	char error[80];
+	if (file == NULL) {
+		sprintf(error, "File %s not found.", filename);
+		fatal(error);
+	}
+
+	int current_line = 0;
+	size_t n = 0;
+	int  result;
+	char * buf = NULL;
+	while ((result = getline(&buf, &n, file)) != -1) {
+		//printf("Retrieved line of length %zu :\n", result);
+		if (current_line == line_n) {
+			fclose(file);
+			return buf;
+		}
+		current_line++;
+
+	}
+	sprintf(error, "File %s does not have a line %d (Starts from 0)", filename, line_n);
+	fclose(file);
+	fatal(error);
+	return NULL;
+}
 
 void compile_expr(const char *str, val_expr_t *e)
 {
@@ -126,22 +159,53 @@ void compile_expr(const char *str, val_expr_t *e)
   111-222  (sequential)
   111:222  (random)
   100@70,200@20,300@10   (probabilistic)
+  111,222  (list)
+  %%file[line] (get operation from file)
 
   */
 
-  if (!strchr(str, '-') && !strchr(str, ':') && !strchr(str, '@')) {
+  if (!strchr(str, '-') && !strchr(str, ':') && !strchr(str, '@') && !strchr(str, ',') && !strchr(str, '%') ) {
     e->mode = EXPR_TYPE_SEQ;
     e->start = e->end = atol(str);
     e->step = 0;
-    e->cur = e->start;
+    e->cur = e->start; 
     return;
   }
+
+  // Defines a file, the expresion is read from the line within [], or the first line in the absence of it.
+  if (strchr(str, '%')) {
+    // parse name of the file, test whether the line is included.
+	char file_name[100];
+	int line_n;
+	char * line = "%filename[1000]";
+    //printf("%d\n",line_n) ;
+	int parseable = sscanf(str, "%%%99[^[][%d[^]]", file_name, &line_n);
+    //printf("%d\n", parseable) ;
+	if (parseable != 2) {
+		// just get the name of the file, and set the line_n to 0
+		line_n = 0;
+		parseable = sscanf(str, "%%%99s", file_name);
+		if (parseable != 1) {
+			// TODO: throw warning and show help.
+			printf("Could not parse file string %s\n", str);
+			fatal("exiting");
+		}
+	}
+
+	// get the string from the line, and then repeat the process using it.
+	char * this_value = read_line(file_name, line_n);
+	compile_expr(this_value, e);
+	free(this_value);
+	return;
+     
+  }
+
 
   if (strchr(str, '-')) {
     e->mode = EXPR_TYPE_SEQ;
     sscanf(str, "%ld-%ld", &e->start, &e->end);
     e->step = 1;
-    e->cur = e->start;
+    e->cur = e->start; 
     return;
   }
 
@@ -149,8 +213,40 @@ void compile_expr(const char *str, val_expr_t *e)
     e->mode = EXPR_TYPE_RND;
     sscanf(str, "%ld:%ld", &e->start, &e->end);
     e->step = 1;
-    e->cur = e->start;
+    e->cur = e->start; 
     return;
+  }
+
+  // A , defines a list. Values are taken sequentially from the list.
+  if (strchr(str, ',') && !(strchr(str, '@'))) {
+	e->mode = EXPR_TYPE_LST;
+	e->step = 1;
+	e->cur = e->start = 0;
+    char *pt;
+	char* s = calloc(strlen(str)+1, sizeof(char));
+	strcpy(s, str);
+	// read through the string twice to know the size
+    pt = strtok (s, ",");
+	int list_size = 0;
+    while (pt != NULL) {
+        pt = strtok (NULL, ",");
+		list_size++;
+    }
+
+	// allocate array for the list
+	e->ptr_list_values = malloc( sizeof(long*) * list_size );
+	// go again, this time filling the string
+	strcpy(s, str);
+
+    pt = strtok (s, ",");
+	int i = 0;
+    while (pt != NULL) {
+		e->ptr_list_values[i++] = atol(pt);
+        pt = strtok (NULL, ",");
+    }
+	e->end = list_size-1;
+
+	return;
   }
 
   if (strchr(str, '@')) {
@@ -163,7 +259,7 @@ void compile_expr(const char *str, val_expr_t *e)
     while (*s) {
       int i;
       sscanf(s, "%ld@%d", &val, &p);
-      if (p + psum > 100)
+      if (p + psum > 100) 
 	break;
       for (i=0; i< p; i++) {
 	e->vals[psum + i] = val;
@@ -172,7 +268,7 @@ void compile_expr(const char *str, val_expr_t *e)
       c = strchr(s, ',');	/* XXX: consider case where s ends with ','! */
       if (c)
 	s = c + 1;
-      else
+      else 
 	break;
     }
     e->start = e->end = e->step = e->cur = 0; /* XXX */
@@ -202,7 +298,7 @@ void compile_ipaddr_expr(const char *str, ipaddr_expr_t *ie)
 	strncpy(buf, str, p - str);
 	compile_expr(buf, &octet);
 	memcpy(&(ie->exp[i]), &octet, sizeof(val_expr_t));
-	if (*p)
+	if (*p) 
 	  str = ++p;
 	break;
       } else {
@@ -212,7 +308,6 @@ void compile_ipaddr_expr(const char *str, ipaddr_expr_t *ie)
     }
   }
 }
-
 
 long expr_val(val_expr_t *e)
 {
@@ -224,15 +319,23 @@ long expr_val(val_expr_t *e)
     if (e->cur > e->end)
       e->cur = e->start;
     return val;
-  case EXPR_TYPE_RND:
-    e->cur =
-      (long)(random()/(double)RAND_MAX * (e->end - e->start) + e->start);
-    if (e->cur < e->start || e->cur > e->end)
+  case EXPR_TYPE_RND: 
+    e->cur = 
+      (long)(random()/(double)RAND_MAX * (e->end - e->start) + e->start); 
+    if (e->cur < e->start || e->cur > e->end) 
       fatal("unexpected random number");
     return e->cur;
-  case EXPR_TYPE_PRB:
+  case EXPR_TYPE_PRB: 
     e->cur = e->vals[(int)(random()/(double)RAND_MAX * (100-1))];
     return e->cur;
+  case EXPR_TYPE_LST:
+    //printf("pointer : %p, value: %dl\n", e->ptr_list_values, *e->ptr_list_values);
+	val = e->ptr_list_values[e->cur];
+	e->cur += e->step;
+    if (e->cur > e->end)
+      e->cur = e->start;
+	//printf("%ld\n", val);
+	return val;
   default:
     fatal("unknown expr mode");
   }
@@ -250,13 +353,13 @@ void expr_addr(char *ipaddr, ipaddr_expr_t *ie)
     if (octet[i] < 0 || octet[i] > 255) {
       fatal("ipaddr_expr error");
     }
-  }
+  }		
   sprintf(ipaddr, "%d.%d.%d.%d", octet[0], octet[1], octet[2], octet[3]);
 
 }
 
 /*
- * Returns sysuptime in millisecond
+ * Returns sysuptime in millisecond 
  *
  */
 #if 0
@@ -301,8 +404,8 @@ u_int32_t sysuptime(void)
     return ((u_int32_t)uptime);
   } else {
     gettimeofday(&tv, (struct timezone *)0);
-    return ((u_int32_t)(uptime +
-			tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0 -
+    return ((u_int32_t)(uptime + 
+			tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0 - 
 			init_tv.tv_sec * 1000.0 + init_tv.tv_usec / 1000.0));
   }
 }
@@ -326,7 +429,7 @@ u_int32_t sysuptime(void)
   }
   return uptime * 1000;		/* returns in millisec */
 }
-#endif
+#endif 
 
 void flush_flow(void)
 {
@@ -343,7 +446,7 @@ void flush_flow(void)
   pdu.hdr.unix_nsecs = htonl(tv.tv_usec * 1000);
   pdu.hdr.flow_sequence = htonl(Ex.flow_seen);
   pdu.hdr.engine_type = expr_val(&Ex.engine_type) & 0xff;
-  pdu.hdr.engine_id = expr_val(&Ex.engine_id) & 0xff;
+  pdu.hdr.engine_id = expr_val(&Ex.engine_id) & 0xff; 
   pdu.hdr.sampling = htons(0);
 
   memset(&pdu.rec[0], 0, sizeof(struct nf_v5_rec) * NF5_MAX_FLOWREC);
@@ -370,12 +473,12 @@ void flush_flow(void)
   }
 
   if (!nosend_f)
-    if (sendto(Ex.sock, &pdu,
-	       sizeof(struct nf_v5_hdr) +
+    if (sendto(Ex.sock, &pdu, 
+	       sizeof(struct nf_v5_hdr) + 
 	       sizeof(struct nf_v5_rec) * Ex.flow_cnt, 0,
-	       (struct sockaddr *)&Ex.to, sizeof(Ex.to)) == -1)
+	       (struct sockaddr *)&Ex.to, sizeof(Ex.to)) == -1) 
       perror("sendto");
-
+  
 
   Ex.pdu_sent++;
   Ex.flow_cnt = 0;
@@ -397,19 +500,19 @@ void cleanup(int val)
   struct timeval now;
 
   flush_flow();
-  fprintf(stderr, "\n%lu flows seen, %lu PDUs sent ",
+  fprintf(stderr, "\n%lu flows seen, %lu PDUs sent ", 
 	  Ex.flow_seen, Ex.pdu_sent);
 
   /* XXX: only care about sec, not usec */
   gettimeofday(&now, (struct timezone *)0);
-  fprintf(stderr, "(session rate = %lu/sec)\n",
+  fprintf(stderr, "(session rate = %lu/sec)\n", 
 	  Ex.flow_seen / (now.tv_sec - Ex.start.tv_sec));
 
   exit(0);
 }
 
 
-void init_exporter(const char *dst, u_int16_t port, u_int32_t flowrec_count)
+void init_exporter(const char *dst, char *local_src_ip, u_int16_t port, u_int32_t flowrec_count)
 {
   struct sigaction sigact;
 
@@ -417,7 +520,7 @@ void init_exporter(const char *dst, u_int16_t port, u_int32_t flowrec_count)
 
   /* XXX: assumes dst is in XXX.XXX.XXX.XXX format */
   inet_aton(dst, &Ex.collector);
-
+  
   Ex.port = port;
 
   if ((Ex.sock = socket(PF_INET, SOCK_DGRAM, 0)) == -1) {
@@ -425,6 +528,19 @@ void init_exporter(const char *dst, u_int16_t port, u_int32_t flowrec_count)
     exit(1);
   }
 
+  // Now bind the socket into a local IP, if one is given
+  if (local_src_ip != NULL) {
+     struct sockaddr_in localaddr;
+     localaddr.sin_family = AF_INET;
+     localaddr.sin_addr.s_addr = inet_addr(local_src_ip);
+     localaddr.sin_port = 0;  // Any local port will do
+     int rc = bind(Ex.sock, (struct sockaddr *)&localaddr, sizeof(localaddr));
+     if (rc != 0) {
+       perror("localip");
+       exit(1);
+     }
+  }
+  
   memset(&Ex.to, 0, sizeof(Ex.to));
   Ex.to.sin_family = AF_INET;
   Ex.to.sin_port = htons(port);
@@ -448,13 +564,14 @@ void init_exporter(const char *dst, u_int16_t port, u_int32_t flowrec_count)
 
 
 /*
- *
+ * 
  *
  */
 int main(int argc, char **argv)
 {
   unsigned long count = 0L;
   char *spoofed_addr = NULL;
+  char *local_ip_addr = NULL;
   u_int16_t port = 2055;
   char *wait = "0";
   char *interval = "1";
@@ -480,9 +597,10 @@ int main(int argc, char **argv)
   char *dst_as = "201-210";
   char *src_mask = "24";
   char *dst_mask = "24";
-  val_expr_t
-    wait_exp, intvl_exp, iif_exp, oif_exp, pkt_exp, oct_exp,
-    fseen_exp, lseen_exp, srcp_exp, dstp_exp, tcpf_exp,
+  bool print_summary = 1;
+  val_expr_t 
+    wait_exp, intvl_exp, iif_exp, oif_exp, pkt_exp, oct_exp, 
+    fseen_exp, lseen_exp, srcp_exp, dstp_exp, tcpf_exp, 
     proto_exp, tos_exp, srcas_exp, dstas_exp, srcmask_exp, dstmask_exp;
   ipaddr_expr_t
     srcaddr_exp, dstaddr_exp, nhop_exp;
@@ -490,13 +608,13 @@ int main(int argc, char **argv)
   long n = 0;
   int wait_f = FALSE;
   int c;
-
+  
   while (1) {
     int option_index = 0;
     static struct option long_options[] = {
       /*
 	const char *name
-	int has_arg
+	int has_arg 
 	int *flag
 	int val
       */
@@ -506,9 +624,10 @@ int main(int argc, char **argv)
       {"wait",		required_argument, NULL, 'w'},
       {"interval", 	required_argument, NULL, 'i'},
       {"flowrec",       required_argument, NULL, 'f'},
-      {"debug",    	required_argument, NULL, 'd'},
-      {"nosend",   	no_argument,       NULL, 'N'},
-      {"help",     	no_argument,       NULL, 'h'},
+      {"debug",    	required_argument, NULL, 'd'}, 
+      {"nosend",   	no_argument,       NULL, 'N'}, 
+      {"help",     	no_argument,       NULL, 'h'}, 
+      {"localipadd",	required_argument, NULL, OPT_LOCAL_IP},
       {"enginetype", 	required_argument, NULL, OPT_ENGINETYPE},
       {"engineid", 	required_argument, NULL, OPT_ENGINEID},
       {"srcaddr",  	required_argument, NULL, OPT_SRCADDR},
@@ -529,10 +648,11 @@ int main(int argc, char **argv)
       {"dstas",    	required_argument, NULL, OPT_DSTAS},
       {"srcmask",  	required_argument, NULL, OPT_SRCMASK},
       {"dstmask",  	required_argument, NULL, OPT_DSTMASK},
+      {"mute_summary",  no_argument, NULL, OPT_NOT_PRINT_SUMMARY},
       {NULL, 0, NULL, 0}
     };
 
-    c = getopt_long(argc, argv, "n:s:p:w:i:f:d:Nh",
+    c = getopt_long(argc, argv, "n:s:p:w:i:f:d:Nh", 
 		    long_options, &option_index);
     if (c == -1)
       break;
@@ -548,6 +668,11 @@ int main(int argc, char **argv)
 
     case 'p':
       port = atoi(optarg);
+      break;
+
+    //case OPT_LOCAL_IP:
+    case OPT_LOCAL_IP:
+      local_ip_addr = optarg;
       break;
 
     case 'w':
@@ -642,7 +767,7 @@ int main(int argc, char **argv)
     case OPT_SRCAS:
       src_as = optarg;
       break;
-
+      
     case OPT_DSTAS:
       dst_as = optarg;
       break;
@@ -650,10 +775,15 @@ int main(int argc, char **argv)
     case OPT_SRCMASK:
       src_mask = optarg;
       break;
-
+      
     case OPT_DSTMASK:
       dst_mask = optarg;
       break;
+
+	case OPT_NOT_PRINT_SUMMARY:
+	  print_summary = 0;
+	  break;
+
 
     default:
       usage();
@@ -667,10 +797,11 @@ int main(int argc, char **argv)
   if (argc != 1)
     usage();
 
-  if (1) {
+  if (print_summary) {
     printf("collector = %s\n",  *argv);
     printf("count     = %lu\n", count);
     printf("spoof     = %s\n",  spoofed_addr ? spoofed_addr : "(none)");
+    printf("local source ip = %s\n",  local_ip_addr);
     printf("port      = %d\n",  port);
     printf("wait      = %s (msec)\n",  wait);
     printf("interval  = %s\n",  interval);
@@ -698,7 +829,7 @@ int main(int argc, char **argv)
     printf("dst_mask  = %s\n",  dst_mask);
   }
 
-  init_exporter(*argv, port, flowrec_count);
+  init_exporter(*argv, local_ip_addr, port, flowrec_count);
 
   compile_expr(wait, &wait_exp);
   compile_expr(interval, &intvl_exp);
@@ -725,6 +856,9 @@ int main(int argc, char **argv)
   compile_expr(src_mask, &srcmask_exp);
   compile_expr(dst_mask, &dstmask_exp);
 
+  if (debug)
+    printf("Starting packet generation.\n");
+
   while (1) {
     char ip_addr[sizeof("XXX.XXX.XXX.XXX")];
 
@@ -741,7 +875,12 @@ int main(int argc, char **argv)
     fi.packets   = (u_int32_t)expr_val(&pkt_exp);
     fi.octets    = (u_int32_t)expr_val(&oct_exp);
 
+	
+  //if (debug)
+    //printf("before systime.\n");
     ut = sysuptime();
+  //if (debug)
+    //printf("after systime.\n");
     fi.last      = ut - (u_int32_t)expr_val(&lseen_exp);
     fi.first     = fi.last - (u_int32_t)expr_val(&fseen_exp);
 
@@ -757,26 +896,27 @@ int main(int argc, char **argv)
 
     add_flow(&fi);
 
+
     if (wait_f) {
       struct timespec req;
       unsigned long w;
 
       if ((n % expr_val(&intvl_exp)) == 0) {
 	w = (unsigned long)expr_val(&wait_exp);
-	req.tv_sec = (w * 1000 * 1000) / 1000000000;
-	req.tv_nsec = (w * 1000 * 1000) % 1000000000;
-	if (nanosleep(&req, NULL) == -1)
+	req.tv_sec = (w * 1000 * 1000) / 1000000000; 
+	req.tv_nsec = (w * 1000 * 1000) % 1000000000; 
+	if (nanosleep(&req, NULL) == -1) 
 	  perror("nanosleep");
-      }
+      } 
     }
 
     n++;
-    if (!count)
+    if (!count) 
       continue;
-    else if (n >= count)
+    else if (n >= count) 
       break;
   }
-
+  
   flush_flow();
 
   if (debug)

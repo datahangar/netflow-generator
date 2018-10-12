@@ -1,26 +1,27 @@
 flowgen
 =======
 
-by Motonori Shindo <motonori@shin.do> (2004 - 2018)
+Code modified from the original of Motonori Shindo in https://github.com/mshindo/NetFlow-Generator.
 
-Introduction
-------------
+The purpose of the modifications were done to use flowgen to **scale** test netflow collectors, such as [pmacct](https://github.com/pmacct/pmacct). 
 
-This program allows you to generate NetFlow V5 packets in various ways and
-send them to NetFlow collectors. You can control how each flow record
-should look like by using an "expression" which can be expressed as
-sequential, random, probablistic, or static numbers.
+Please read the original repository for instructions.
 
-Installation
-------------
+Changes
+------
+* Added two extra ways of defining values for flow characteristics:
+	* Using a comma (,) for defining a list of values.
+	* Using %%file[line] to define a file and a line from which the number specification should be read.
+* Added an option to specify a local IP (localipadd) from which packets should be originated.
+* Added an option to not print flow generation report.
 
-How to compile & install this program is pretty straightforward:
-
- 1. Edit Makefile accordingly
- 2. make
- 3. make install
+In TDB, I am also adding a python script that generates specific calls to flowgen for simulating traffic from a larger, random, network.
 
 License
 -------
+GNU General Public License, version 2 (GPL-2.0)
 
-GNU General Public License, verion 2 (GPL-2.0)
+
+
+
+

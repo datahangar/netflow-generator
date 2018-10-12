@@ -25,6 +25,7 @@
 #define EXPR_TYPE_SEQ	1	/* Sequential */
 #define EXPR_TYPE_RND	2	/* Random */
 #define EXPR_TYPE_PRB	3	/* Probabilistic */
+#define EXPR_TYPE_LST	4	/* List */
 
 typedef struct val_expr {
   int mode;		/* EXPR_TYPE_SEQ, EXPR_TYPE_RND or EXPR_TYPE_PRB */
@@ -33,6 +34,7 @@ typedef struct val_expr {
   long step;
   long vals[100];
   long cur;
+  long *ptr_list_values;
 } val_expr_t;
 
 typedef struct ipaddr_expr {
@@ -132,3 +134,4 @@ struct flow_exporter {
   int bucket_size;	/* when flow_cnt reaches bucket_size, flow_info will be flushed */
   struct flow_info fi[MAX_FLOW_INFO];
 };
+
